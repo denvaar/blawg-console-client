@@ -1,184 +1,88 @@
-extern crate chrono;
-extern crate hmac;
-extern crate reqwest;
-extern crate sha2;
-extern crate structopt;
-extern crate tempfile;
-
-use chrono::{Datelike, Utc};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 use structopt::StructOpt;
-use tempfile::NamedTempFile;
 
-type HmacSha256 = Hmac<Sha256>;
-
-const CONTENT_BEGIN: &str = "████████████████████████████████████████
-██████████████  CONTENT  ███████████████
-████████████████████████████████████████";
-const DATE_BEGIN: &str = "████████████████████████████████████████
-██████████████   DATE    ███████████████
-████████████████████████████████████████";
-const TAGS_BEGIN: &str = "████████████████████████████████████████
-██████████████   TAGS    ███████████████
-████████████████████████████████████████";
-const TAGS_END: &str = "\n";
+mod auth;
+mod article_type;
+mod reqwester;
+mod edit;
 
 #[derive(Debug, StructOpt)]
-#[structopt(name = "Blawg", about = "Use plain text editor of choice to manage web content.")]
+#[structopt(
+    name = "blawg",
+    about = "Create, edit, and publish articles to the web from the safety of your favorite plain text editor."
+)]
 struct Opt {
-    #[structopt(parse(from_os_str))]
+    #[structopt(parse(from_os_str), help = "Path to a file. The content will be loaded as the content of an article.")]
     input: Option<PathBuf>,
+    #[structopt(short = "u", long = "update", help = "Update an existing article")]
+    slug: Option<String>,
+    #[structopt(short = "d", long = "delete", help = "Delete an article")]
+    delete_slug: Option<String>,
+    #[structopt(short = "p", long = "publish", help = "Publish an article")]
+    publish_slug: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-
-
-    // Check for required ENV variables
-
-    let api_create_url = match std::env::var("BLAWG_API_CREATE") {
-        Ok(url) => url,
-        Err(_e) => {
-            eprintln!("Error: 'BLAWG_API_CREATE' environment variable undefined.");
-            std::process::exit(1);
-        }
-    };
-
     let opt = Opt::from_args();
 
-
-    // Prepare contents of temporary file
-
-    let existing_content = match opt.input {
-        Some(file_path) => std::fs::read_to_string(file_path)?,
-        None => String::from(""),
+    match opt.delete_slug {
+        Some(slug) => delete_article(slug),
+        None => ()
     };
 
-    let file = NamedTempFile::new()?;
-    let path = file.path();
-    std::fs::write(path, build_defaults(&existing_content))?;
-
-
-    // Spawn text editor to to open a new document
-    // which is formatted correctly, and has appropriate
-    // content.
-
-    let text_editor_cmd = match std::env::var("BLAWG_EDITOR") {
-        Ok(cmd) => cmd,
-        Err(_e) => {
-            eprintln!("Error: 'BLAWG_EDITOR' environment variable undefined.");
-            std::process::exit(1);
-        }
+    match opt.slug {
+        Some(slug) => update_existing_article(slug),
+        None => create_new_article(opt.input)
     };
-
-    let child = match Command::new(&text_editor_cmd).arg(file.path()).spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("Error: Could not open text editor.\n{:?}", e);
-            std::process::exit(1);
-        }
-    };
-
-
-    // Collect output from file when editor is closed
-    // and create a request payload.
-
-    let _output = child.wait_with_output()
-        .expect("Failed to wait on child process");
-    let content_payload = std::fs::read_to_string(file.path())?;
-    let request = create_request_payload(&content_payload);
-
-
-    // Hash the contents of the message and
-    // send the request.
-
-    let date = request.get("date");
-    let content = request.get("content");
-    let tags = request.get("tags");
-
-    if let (Some(date), Some(content), Some(tags)) = (date, content, tags) {
-
-        let response =
-            reqwest::Client::new()
-            .post(&api_create_url)
-            .json(&request)
-            .header(reqwest::header::AUTHORIZATION, create_request_hmac(&date, &content, &tags))
-            .send()?;
-
-
-        match response.status() {
-            reqwest::StatusCode::OK => println!("Posted"),
-            unhandled => println!("{:?}", unhandled),
-        };
-    }
 
     Ok(())
 }
 
-fn extract(content: &String, delim: (&str, &str)) -> String {
-    let s = &content[content.find(delim.0).unwrap()..];
-    let start = s.trim_start_matches(delim.0);
+fn delete_article(slug: String) -> () {
+    println!("delete slug '{}'", &slug);
 
-    if delim.1 == "\n" {
-        return String::from(start.trim());
-    }
+    // create auth hash
+    let empty_article = article_type::Article {
+        article: article_type::ArticleData { content: String::from(""), title: String::from("") }
+    };
+    let hmac = auth::create_request_hmac(&empty_article, vec![]);
+    // create a DELETE request
+    let response = reqwester::delete_article(slug, hmac);
+    // display response
+    println!("{:?}", response);
 
-    let ind = start.find(delim.1).unwrap();
-    let (result, _junk) = start.split_at(ind);
-
-    String::from(result.trim())
+    std::process::exit(0);
 }
 
-fn build_defaults(existing_content: &str) -> String {
-    let default_tags = "";
-    let now = Utc::now();
-    let (_ce, year) = now.year_ce();
-    let default_date = format!("{}/{}/{}", now.month(), now.day(), year);
-    let default_content = format!(
-        "{begin_content}\n{content}\n\n{begin_date}\n{date}\n\n{begin_tags}\n{tags}{end_tags}",
-        date=default_date,
-        tags=default_tags,
-        begin_content=CONTENT_BEGIN,
-        content=existing_content,
-        begin_date=DATE_BEGIN,
-        begin_tags=TAGS_BEGIN,
-        end_tags=TAGS_END
-    );
+fn update_existing_article(slug: String) -> () {
+    println!("do an update using slug '{}'", &slug);
 
-    String::from(default_content)
+    // get existing article with slug
+    let mut article: article_type::Article = reqwester::fetch_article_content(&slug);
+    // open existing content in text editor
+    article = edit::open_editor(article);
+    println!("{:?}", article);
+    // create auth hash
+    let hmac = auth::create_request_hmac(&article, vec!["article", "content", "title"]);
+    println!("{:?}", hmac);
+    // send a PATCH request
+    let response = reqwester::update_article(article, slug, hmac);
+    // display response
+    println!("{:?}", response);
+
+    std::process::exit(0);
 }
 
-fn create_request_payload(content_payload: &String) -> HashMap<&str, String> {
-    let content = extract(content_payload,
-                          (CONTENT_BEGIN, DATE_BEGIN));
-    let date = extract(content_payload,
-                          (DATE_BEGIN, TAGS_BEGIN));
-    let tags = extract(content_payload,
-                          (TAGS_BEGIN, TAGS_END));
+fn create_new_article(file_path: Option<PathBuf>) -> () {
+    // create new document, or open existing content in text editor
+    let article: article_type::Article = edit::open_editor_with_file(file_path);
+    // create auth hash
+    let hmac = auth::create_request_hmac(&article, vec!["content", "title"]);
+    println!("{:?}", hmac);
+    // send a POST request
+    let response = reqwester::create_article(article, hmac);
+    // display response
+    println!("{:?}", &response);
 
-    let mut request = HashMap::new();
-    request.insert("content", content);
-    request.insert("date", date);
-    request.insert("tags", tags);
-
-    request
-}
-
-fn create_request_hmac(date: &String, content: &String, tags: &String) -> String {
-    let mut mac = HmacSha256::new_varkey(b"secret_key")
-        .expect("HMAC can take key of any size");
-    mac.input(format!("{}{}{}", date, content, tags).as_bytes());
-    let result = mac.result();
-    let code_bytes = result.code();
-
-    format!(
-        "hmac {}",
-        code_bytes
-            .iter()
-            .map(|x| format!("{:02x}", x))
-            .fold(String::new(), |acc, x| { acc + &x })
-    )
+    std::process::exit(0);
 }
